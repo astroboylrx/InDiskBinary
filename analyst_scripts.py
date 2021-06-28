@@ -527,6 +527,10 @@ class dv_grav:
                 (self._dv_grav_2[t].cumsum(axis=0)[idx_diff::2] 
                  - np.vstack([[0, 0], self._dv_grav_2[t].cumsum(axis=0)[1:-Nf:2]])) / self._2dt[:, np.newaxis] )
         
+        if kwargs.get("dot_L_take_over", False):
+            return
+        
+        # Below we assume the system is 2D
         if fcb.e == 0:
             # phase contains orb_dir, no need to include it elsewhere (the length of phase is 1 smaller than time)
             phase = fcb.orb_dir * 2*np.pi * self.t[1:] / fcb.P_bbox
@@ -590,14 +594,20 @@ class dmdp_acc:
         f.close()
 
         self.t, self.dt = self.data[:, :2].T
-        self.mdot = []; self.pdot = []; self.Fpres = []; self.Facc = []; self.mdot_tot = []
+        self.mdot = []; self.mdot_tot = []; self.pdot = []; self.Fpres = []; 
+        #self.Facc = []
         for idx_r in range(num_r_ev):
             self.mdot.append(self.data[:, 2+idx_r*num_col_set:4+idx_r*num_col_set].T)
             self.mdot_tot.append(self.mdot[-1][0] + self.mdot[-1][1])
             self.pdot.append(self.data[:, 4+idx_r*num_col_set:10+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
             self.Fpres.append(self.data[:, 10+idx_r*num_col_set:16+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
-            self.Facc.append(self.pdot[-1] + self.Fpres[-1])
+            
+            # Facc below only makes sense in inertial frames; there are extra calculations for rotating frames
+            #self.Facc.append(self.pdot[-1] + self.Fpres[-1])
 
+        if kwargs.get("dot_L_take_over", False):
+            return
+        
         # Below we assume the system is 2D
         if fcb.e == 0:
             # phase contains orb_dir, no need to include it elsewhere (the length of phase is 1 smaller than time)
@@ -616,19 +626,21 @@ class dmdp_acc:
             self.vb = self.v1 - self.v2
 
         # only calculate quantities for t[1:] to match data in dv_grav
-        self.dot_L_dp_acc = []; self.dot_L_fp_acc = []; self.dot_L_acc = []
         self.facc1 = []; self.facc2 = []; self.fpres1 = []; self.fpres2 = []
+        #self.dot_L_dp_acc = []; self.dot_L_fp_acc = []; self.dot_L_acc = []
         for idx_r in range(num_r_ev):
             self.facc1.append((self.pdot[idx_r][0][:2, 1:] - self.mdot[idx_r][0][1:] * self.v1) / fcb.M1)
             self.facc2.append((self.pdot[idx_r][1][:2, 1:] - self.mdot[idx_r][1][1:] * self.v2) / fcb.M2)
             self.fpres1.append(self.Fpres[idx_r][0][:2, 1:] / fcb.M1)
             self.fpres2.append(self.Fpres[idx_r][1][:2, 1:] / fcb.M2)
-            self.dot_L_dp_acc.append(np.cross(self.r1, self.pdot[idx_r][0][:2, 1:].T) 
-                                     + np.cross(self.r2, self.pdot[idx_r][1][:2, 1:].T))
-            self.dot_L_fp_acc.append(np.cross(self.r1, self.Fpres[idx_r][0][:2, 1:].T) 
-                                     + np.cross(self.r2, self.Fpres[idx_r][1][:2, 1:].T))
-            self.dot_L_acc.append(np.cross(self.r1, self.Facc[idx_r][0][:2, 1:].T)
-                                  + np.cross(self.r2, self.Facc[idx_r][1][:2, 1:].T))
+
+            # dot_L_xxx below only make sense in inertial frames; there are extra calculations for rotating frames
+            #self.dot_L_dp_acc.append(np.cross(self.r1, self.pdot[idx_r][0][:2, 1:].T) 
+            #                         + np.cross(self.r2, self.pdot[idx_r][1][:2, 1:].T))
+            #self.dot_L_fp_acc.append(np.cross(self.r1, self.Fpres[idx_r][0][:2, 1:].T) 
+            #                         + np.cross(self.r2, self.Fpres[idx_r][1][:2, 1:].T))
+            #self.dot_L_acc.append(np.cross(self.r1, self.Facc[idx_r][0][:2, 1:].T)
+            #                      + np.cross(self.r2, self.Facc[idx_r][1][:2, 1:].T))
         
 class dot_L:
     
@@ -652,83 +664,101 @@ class dot_L:
             max_row = min(max_row_dmdp, max_row_dv) - 1
             print("using the most compatible max_row = ", max_row)
             
-        self.dmdp = dmdp_acc(data_dir + "dmdp_acc.dat", self.fcb, row_limit=max_row, **kwargs.get("dmdp_kw", {}))
-        self.dv = dv_grav(data_dir + "dv_grav.dat", self.fcb, row_limit=max_row, **kwargs.get("dv_kw", {}))
+        self.dmdp = dmdp_acc(data_dir + "dmdp_acc.dat", self.fcb, row_limit=max_row, dot_L_take_over=True,  **kwargs.get("dmdp_kw", {}))
+        self.dv = dv_grav(data_dir + "dv_grav.dat", self.fcb, row_limit=max_row, dot_L_take_over=True, **kwargs.get("dv_kw", {}))
         
         if self.dmdp.num_r_ev != self.dv.Nt:
             raise ValueError("self.dmdp.num_r_ev != self.dv.Nt")
 
-        self.dot_l_tot, self.dot_L_tot, self.dot_L_v2 = [], [], [] # specific/total angular momentum, v2 should = tot
-        self.dot_eth = [] # specific energy
-
-        # other than dot_l, the others are not in the right reference frame
-        """
-        for idx in range(self.dmdp.num_r_ev):
-            self.dot_L_tot.append(self.dv.dot_L_grav[idx] + self.dmdp.dot_L_dp_acc[idx] + self.dmdp.dot_L_fp_acc[idx])
-            self.dot_l_tot.append(np.cross(self.dv.rb, ((self.dv.f_grav_1[idx] - self.dv.f_grav_2[idx])
-                                                        + (self.dmdp.facc1[idx] - self.dmdp.facc2[idx]
-                                                           + self.dmdp.fpres1[idx] - self.dmdp.fpres2[idx]).T)))
-            self.dot_eth.append(- self.dmdp.mdot_tot[idx][1:] / self.fcb.a_b
-                                + np.sum(self.dv.vb * ((self.dv.f_grav_1[idx] - self.dv.f_grav_2[idx]).T
-                                                       + (self.dmdp.facc1[idx] - self.dmdp.facc2[idx]
-                                                          + self.dmdp.fpres1[idx] - self.dmdp.fpres2[idx])), axis=0))
-            self.dot_L_v2.append(self.fcb.mu_b * self.dot_l_tot[-1]
-                                 + self.dmdp.mdot[idx][0][1:] * np.cross(self.dmdp.r1, self.dmdp.v1.T)
-                                 + self.dmdp.mdot[idx][1][1:] * np.cross(self.dmdp.r2, self.dmdp.v2.T))
-        
-        self.adot_oa_L, self.adot_oa_l, self.adot_oa_eth = [], [], []
-        for idx_r in range(self.dmdp.num_r_ev):
-            self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 - 3 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
-            self.adot_oa_l.append(2 * self.dot_l_tot[idx_r] / self.fcb.l_0 - self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
-            self.adot_oa_eth.append(self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0))
-        """
+        # Below we assume the system is 2D and calculate binary's positions/velocities and their inertial velocities
+        if self.fcb.e == 0:
+            # phase contains orb_dir, no need to include it elsewhere (the length of phase is 1 smaller than time)
+            phase = self.fcb.orb_dir * 2*np.pi * self.dmdp.t[1:] / self.fcb.P_bbox
+            # transpose to be crossed with f_grav
+            self.r1 = np.array([np.cos(-np.pi   + phase), np.sin(-np.pi   + phase)]).T * self.fcb.a_b * self.fcb.M2/self.fcb.M_b
+            self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * self.fcb.a_b * self.fcb.M1/self.fcb.M_b
+            self.rb = self.r1 - self.r2
+            # no transpose for v so rb x vb can be done easier
+            self.v1 = np.array([np.cos(-np.pi/2 + phase), np.sin(-np.pi/2 + phase)]) * self.fcb.v_orbbox * self.fcb.M2/self.fcb.M_b
+            self.v2 = np.array([np.cos( np.pi/2 + phase), np.sin( np.pi/2 + phase)]) * self.fcb.v_orbbox * self.fcb.M1/self.fcb.M_b
+            self.vb = self.v1 - self.v2
+        else:
+            self.r1, self.r2, self.v1, self.v2 = self.fcb.get_pos(self.dmdp.t[1:])
+            self.rb = self.r1 - self.r2
+            self.vb = self.v1 - self.v2
         """ From Dong's discussions: r_b is the same, regardless of the reference frame, but x-y decomposition is different in 
             different frames. On the contrary, v_b is different, but can be connected to do inertial frame calculations:
             v_b = v_b' + Omega_K x r_b'
             which is very different than the direct computation from phase: v_b(t) = Omega_b x r_b(t)
         """
-        self.v1_inertial = self.dv.v1 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.dv.r1)[:, :2].T
-        self.v2_inertial = self.dv.v2 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.dv.r2)[:, :2].T
+        self.v1_inertial = self.v1 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.r1)[:, :2].T
+        self.v2_inertial = self.v2 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.r2)[:, :2].T
         self.vb_inertial = self.v1_inertial - self.v2_inertial
         # alternatively, this can be done through 
         #   self.dv.vb + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.dv.rb)[:, :2].T
         # which may differ on the order of machine precision
-        for idx in range(self.dmdp.num_r_ev):
-            self.dot_l_tot.append(np.cross(self.dv.rb, ((self.dv.f_grav_1[idx] - self.dv.f_grav_2[idx])
-                                                        + (self.dmdp.facc1[idx] - self.dmdp.facc2[idx]
-                                                           + self.dmdp.fpres1[idx] - self.dmdp.fpres2[idx]).T)))
-            self.dot_eth.append(- self.dmdp.mdot_tot[idx][1:] / self.fcb.a_b
-                                + np.sum(self.vb_inertial * ((self.dv.f_grav_1[idx] - self.dv.f_grav_2[idx]).T
-                                                            + (self.dmdp.facc1[idx] - self.dmdp.facc2[idx]
-                                                            + self.dmdp.fpres1[idx] - self.dmdp.fpres2[idx])), axis=0))
-            self.dot_L_tot.append(self.fcb.mu_b * self.dot_l_tot[-1]
-                                  + self.dmdp.mdot[idx][0][1:] * np.cross(self.dmdp.r1, self.v1_inertial.T)
-                                  + self.dmdp.mdot[idx][1][1:] * np.cross(self.dmdp.r2, self.v2_inertial.T))
-            self.dot_L_v2.append(self.fcb.mu_b * self.dot_l_tot[-1]
-                                 + self.dmdp.mdot_tot[idx][1:] / self.fcb.M_b 
-                                 * self.fcb.mu_b * np.cross(self.dv.rb, self.vb_inertial.T))
-            
         
-        self.adot_oa_L, self.adot_oa_l, self.adot_oa_eth, self.adot_oa_Lv2 = [], [], [], []
+        # only calculate quantities for t[1:] to match data in self.dv_grav
+        self.facc1 = []; self.facc2 = []; self.fpres1 = []; self.fpres2 = []
+        for idx_r in range(self.dmdp.num_r_ev):
+            self.facc1.append((self.dmdp.pdot[idx_r][0][:2, 1:] - self.dmdp.mdot[idx_r][0][1:] * self.v1) / self.fcb.M1)
+            self.facc2.append((self.dmdp.pdot[idx_r][1][:2, 1:] - self.dmdp.mdot[idx_r][1][1:] * self.v2) / self.fcb.M2)
+            self.fpres1.append(self.dmdp.Fpres[idx_r][0][:2, 1:] / self.fcb.M1)
+            self.fpres2.append(self.dmdp.Fpres[idx_r][1][:2, 1:] / self.fcb.M2)
+        # specific torques
+        self.facc_1m2 = []; self.fpres_1m2 = [];
+        self.dot_l_acc = []; self.dot_l_pres = []; self.dot_L_acc = []; self.dot_L_pres = []
+        self.dot_eth_acc = []; self.dot_eth_pres = []
+        for idx_r in range(self.dmdp.num_r_ev):
+            self.facc_1m2.append(self.facc1[idx_r] - self.facc2[idx_r])
+            self.fpres_1m2.append(self.fpres1[idx_r] - self.fpres2[idx_r])
+            self.dot_l_acc.append(np.cross(self.rb, (self.facc_1m2[-1]).T))
+            self.dot_l_pres.append(np.cross(self.rb, (self.fpres_1m2[-1]).T))
+            self.dot_L_acc.append(self.fcb.mu_b * self.dot_l_acc[-1])
+            self.dot_L_pres.append(self.fcb.mu_b * self.dot_l_pres[-1])
+            self.dot_eth_acc.append(np.sum(self.vb_inertial * self.facc_1m2[-1], axis=0))
+            self.dot_eth_pres.append(np.sum(self.vb_inertial * self.fpres_1m2[-1], axis=0))
+
+        # np.cross treat the last axis as the vector axis (so r1/r2 is transposed)
+        self.fgrav_1m2 = []
+        self.dot_l_grav = []; self.dot_L_grav = [];
+        self.dot_eth_grav = []
+        for t in range(self.dv.Nt):
+            self.fgrav_1m2.append(self.dv.f_grav_1[t] - self.dv.f_grav_2[t])
+            self.dot_l_grav.append(np.cross(self.rb, self.fgrav_1m2[-1]))
+            self.dot_L_grav.append(self.fcb.mu_b * self.dot_l_grav[-1])
+            self.dot_eth_grav.append(np.sum(self.vb_inertial * (self.fgrav_1m2[-1]).T, axis=0))
+
+        # now all other terms toward total quantities
+        self.dot_L_mu_b = []; 
+        self.dot_l_tot, self.dot_L_tot, self.dot_eth = [], [], []
+        for idx in range(self.dmdp.num_r_ev):
+            self.dot_L_mu_b.append(self.dmdp.mdot[idx][0][1:] * np.cross(self.r1, self.v1_inertial.T)
+                                   + self.dmdp.mdot[idx][1][1:] * np.cross(self.r2, self.v2_inertial.T))
+            self.dot_l_tot.append(self.dot_l_grav[idx] + self.dot_l_acc[idx] + self.dot_l_pres[idx])
+            self.dot_L_tot.append(self.dot_L_grav[idx] + self.dot_L_acc[idx] + self.dot_L_pres[idx] + self.dot_L_mu_b[-1])
+            self.dot_eth.append(- self.dmdp.mdot_tot[idx][1:] / self.fcb.a_b 
+                                + self.dot_eth_grav[idx] + self.dot_eth_acc[idx] + self.dot_eth_pres[idx])
+        
+        self.adot_oa_eth, self.adot_oa_l, self.adot_oa_L = [], [], []
         self.e2dot = []
         for idx_r in range(self.dmdp.num_r_ev):
             self.adot_oa_eth.append(self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0))
-            if self.fcb.e == 0:
+            if self.fcb.e == 0.0:
                 self.adot_oa_l.append(2 * self.dot_l_tot[idx_r] / self.fcb.l_0 - self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
                 if self.fcb.q_b == 1.0:
                     self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 - 3 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
-                    self.adot_oa_Lv2.append(2 * self.dot_L_v2[idx_r] / self.fcb.L_0 - 3 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
                 else:
                     self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 + self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b
                                         - 2 * self.dmdp.mdot[idx_r][0, 1:] / self.fcb.M1 - 2 * self.dmdp.mdot[idx_r][1, 1:] / self.fcb.M2)
-                    self.adot_oa_Lv2.append(np.copy(self.adot_oa_L[-1]))
             else:
-                self.adot_oa_l.append(np.copy(self.adot_oa_eth[-1]))
-                self.adot_oa_L.append(np.copy(self.adot_oa_eth[-1]))
-                self.adot_oa_Lv2.append(np.copy(self.adot_oa_L[-1]))
+                self.adot_oa_l.append(None); self.adot_oa_L.append(None)
                 self.e2dot.append((2 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0) 
                                    - 2 * (self.dot_l_tot[idx_r] / self.fcb.l_0)) * (1 - self.fcb.e**2))
                 #if self.fcb.q_b == 1.0:
+                #    pass    
+                #else:
+                #    raise NotImplementedError("The analysis code for e>0 and q_b<1 hasn't been implemented yet...")
 
 
 # ******************************************************************************
