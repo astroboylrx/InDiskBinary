@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import pyridoxine.utility as rxu
 import pyridoxine.plt as rxplt
 from multiprocessing import Pool
+from multiprocess import Pool as mPool
 
 # ******************************************************************************
 # For reading data and all sorts of plotting
@@ -94,7 +95,7 @@ def single_frame_zoomcenter_Q_no_fcb_stream(b, figsize=(13.5, 6.5), **kwargs):
     ax[0].streamplot(b[lev].ccx, b[lev].ccy, (b[lev]['ux']/b[lev]['rhog']), (b[lev]['uy']/b[lev]['rhog']), color='lime')
     ax[0].set_xlim([b[0].box_min[0], b[0].box_max[0]]); ax[0].set_ylim([b[0].box_min[1], b[0].box_max[1]]) # sometimes white space appears
     lev = kwargs.get("zoom_stream_level", -2)
-    if 'fcb' in kwargs:
+    if kwargs.get('fcb', None) is not None:
         fcb = kwargs.get('fcb'); fcb.update_pos(b[lev].t)
         r_sink = kwargs.get('r_sink', 0.04)
         ux = b[lev]['ux']/b[lev]['rhog']; uy = b[lev]['uy']/b[lev]['rhog']
@@ -232,7 +233,7 @@ def _rollingaverage(t, dt, q, window, step):
     ra_q = [(q[ii:ie+1] * dt[ii:ie+1]).sum() / dt_sum[j] for j, (ii, ie) in enumerate(zip(idx_i, idx_e))]
     return ra_t, ra_q
 
-def rollingaverage(t, dt, q, window, step):
+def rollingaverage(t, dt, q, window, step, num_pool=-1):
     """ rolling average but only return the quantity w/o time """
 
     t_series = np.linspace(t[0] + window/2, t[-1] - window/2, int((t[-1]-t[0]-window)/step))
@@ -240,8 +241,15 @@ def rollingaverage(t, dt, q, window, step):
     idx_i = get_closest(t, t_s_i); idx_e = get_closest(t, t_s_e)
     # zip object cannot be re-used
     #dt_sum = [dt[ii:ie+1].sum() for ii, ie in zip(idx_i, idx_e)]
-    ra_q = [(q[ii:ie+1] * dt[ii:ie+1]).sum() / dt[ii:ie+1].sum() for ii, ie in zip(idx_i, idx_e)]
-    return np.array(ra_q)
+    if num_pool <= 1:
+        ra_q = np.array([(q[ii:ie+1] * dt[ii:ie+1]).sum() / dt[ii:ie+1].sum() for ii, ie in zip(idx_i, idx_e)])
+    else:
+        ave = lambda idx : (q[idx[0]:idx[1]+1] * dt[idx[0]:idx[1]+1]).sum() / dt[idx[0]:idx[1]+1].sum()
+        p = mPool(num_pool)
+        ra_q = np.array(p.map(ave, zip(idx_i, idx_e)))
+        p.close()
+        p.join()
+    return ra_q
 
 def FE(E, e, M):
     return E-e*np.sin(E)-M
@@ -307,9 +315,12 @@ class FixedCircularBinary:
         if abs(self.M_b - self.R_H**3 * 3 * self.Omega_K**2)/self.M_b >= 1e-15:
             raise ValueError("Parameters are not consistent: M_b=", self.M_b, ", lam=",
                              self.lam, ", Omega_K=", self.Omega_K)
-
+        
+        # 1:prograde/counter-clockwise; -1:retrograde/clockwise;
+        self.orb_dir = kwargs.get('orb_dir', 1)
+        
         # now correct for the shearing box frame
-        self.Omega_bbox = self.Omega_b - self.Omega_K
+        self.Omega_bbox = self.Omega_b - self.orb_dir * self.Omega_K
         if "wrong_frame" in kwargs:
             self.Omega_bbox = self.Omega_b # for simulations in wrong frames
         self.P_bbox = 2*np.pi / self.Omega_bbox # P_bbox is what matters for calculating r and v
@@ -333,14 +344,12 @@ class FixedCircularBinary:
         self.num_pool = kwargs.get('Npool', 0)
         
         self.mu_b = self.M1 * self.M2 / self.M_b
-        self.L_0 = self.mu_b * np.sqrt(self.M_b * self.a_b * (1 - self.e**2))
-        self.l_0 = np.sqrt(self.M_b * self.a_b * (1 - self.e**2))
+        self.L_0 = self.orb_dir * self.mu_b * np.sqrt(self.M_b * self.a_b * (1 - self.e**2))
+        self.l_0 = self.orb_dir * np.sqrt(self.M_b * self.a_b * (1 - self.e**2))
         self.E_0 = -self.mu_b * self.M_b / (2*self.a_b)
         self.eth_0 = -self.M_b / (2*self.a_b)
         
         # initial position and velocity
-        # 1:prograde/counter-clockwise; -1:retrograde/clockwise;
-        self.orb_dir = kwargs.get('orb_dir', 1)
 
         # here, r_b0 and v_b0 are vectors from m1 to m2, which follows SSD's definition and differs from MML19
         # example vector from m1 to m2: r12 = r2 - r1
@@ -358,8 +367,10 @@ class FixedCircularBinary:
             phase = self.orb_dir * 2*np.pi * t / self.P_bbox
             self.r1 = np.array([np.cos(-np.pi   + phase), np.sin(-np.pi   + phase)]) * self.a_b * self.M2/self.M_b
             self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]) * self.a_b * self.M1/self.M_b
-            self.v1 = np.array([np.cos(-np.pi/2 + phase), np.sin(-np.pi/2 + phase)]) * self.v_orbbox * self.M2/self.M_b
-            self.v2 = np.array([np.cos( np.pi/2 + phase), np.sin( np.pi/2 + phase)]) * self.v_orbbox * self.M1/self.M_b
+            self.v1 = np.array([np.cos(-np.pi/2*self.orb_dir + phase), 
+                                np.sin(-np.pi/2*self.orb_dir + phase)]) * self.v_orbbox * self.M2/self.M_b
+            self.v2 = np.array([np.cos( np.pi/2*self.orb_dir + phase), 
+                                np.sin( np.pi/2*self.orb_dir + phase)]) * self.v_orbbox * self.M1/self.M_b
         else:
             tmp_num_pool = self.num_pool
             self.num_pool = 0
@@ -416,7 +427,7 @@ class FixedCircularBinary:
         f_func = 1/(1-self.e) * (np.cos(E) - 1) + 1
         g_func = M + (np.sin(E) - E)
 
-        phase_K = (self.dot_curly_pi - self.Omega_K) * t
+        phase_K = self.orb_dir * (self.dot_curly_pi - self.Omega_K) * t
         # note that this r_b is r2 - r1 but we use r1 - r2 in other calculations
         r_b = np.array([f_func * np.cos(phase_K) * self.r_b0[0] + g_func * (-np.sin(phase_K)) * self.v_b0[1], 
                         f_func * np.sin(phase_K) * self.r_b0[0] + g_func * np.cos(phase_K) * self.v_b0[1]]).T
@@ -509,7 +520,7 @@ class dv_grav:
         self._dv_grav_1 = []; self._dv_grav_2 = []
         for t in range(Nt):
             self._dv_grav_1.append(np.insert(self.data[:, 2+t*8:4+t*8], np.arange(1, self.t.size+1), self.data[:, 6+t*8:8+t*8], axis=0))
-            self._dv_grav_2.append(np.insert(self.data[:, 4+t*8:6+t*8], np.arange(1, self.t.size+1), self.data[:, 8+t*8:10+t*8], axis=0))        
+            self._dv_grav_2.append(np.insert(self.data[:, 4+t*8:6+t*8], np.arange(1, self.t.size+1), self.data[:, 8+t*8:10+t*8], axis=0))
         
         # now for centered-difference f_grav_i
         # b/c when n = 1
@@ -539,8 +550,10 @@ class dv_grav:
             self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * fcb.a_b * fcb.M1/fcb.M_b
             self.rb = self.r1 - self.r2
             # no transpose for v so rb x vb can be done easier
-            self.v1 = np.array([np.cos(-np.pi/2 + phase), np.sin(-np.pi/2 + phase)]) * fcb.v_orbbox * fcb.M2/fcb.M_b
-            self.v2 = np.array([np.cos( np.pi/2 + phase), np.sin( np.pi/2 + phase)]) * fcb.v_orbbox * fcb.M1/fcb.M_b
+            self.v1 = np.array([np.cos(-np.pi/2*fcb.orb_dir + phase), 
+                                np.sin(-np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M2/fcb.M_b
+            self.v2 = np.array([np.cos( np.pi/2*fcb.orb_dir + phase), 
+                                np.sin( np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M1/fcb.M_b
             self.vb = self.v1 - self.v2
         else:
             self.r1, self.r2, self.v1, self.v2 = fcb.get_pos(self.t[1:])
@@ -617,8 +630,10 @@ class dmdp_acc:
             self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * fcb.a_b * fcb.M1/fcb.M_b
             self.rb = self.r1 - self.r2
             # no transpose for v so rb x vb can be done easier
-            self.v1 = np.array([np.cos(-np.pi/2 + phase), np.sin(-np.pi/2 + phase)]) * fcb.v_orbbox * fcb.M2/fcb.M_b
-            self.v2 = np.array([np.cos( np.pi/2 + phase), np.sin( np.pi/2 + phase)]) * fcb.v_orbbox * fcb.M1/fcb.M_b
+            self.v1 = np.array([np.cos(-np.pi/2*fcb.orb_dir + phase), 
+                                np.sin(-np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M2/fcb.M_b
+            self.v2 = np.array([np.cos( np.pi/2*fcb.orb_dir + phase), 
+                                np.sin( np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M1/fcb.M_b
             self.vb = self.v1 - self.v2
         else:
             self.r1, self.r2, self.v1, self.v2 = fcb.get_pos(self.t[1:])
@@ -679,8 +694,10 @@ class dot_L:
             self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * self.fcb.a_b * self.fcb.M1/self.fcb.M_b
             self.rb = self.r1 - self.r2
             # no transpose for v so rb x vb can be done easier
-            self.v1 = np.array([np.cos(-np.pi/2 + phase), np.sin(-np.pi/2 + phase)]) * self.fcb.v_orbbox * self.fcb.M2/self.fcb.M_b
-            self.v2 = np.array([np.cos( np.pi/2 + phase), np.sin( np.pi/2 + phase)]) * self.fcb.v_orbbox * self.fcb.M1/self.fcb.M_b
+            self.v1 = np.array([np.cos(-np.pi/2*self.fcb.orb_dir + phase), 
+                                np.sin(-np.pi/2*self.fcb.orb_dir + phase)]) * self.fcb.v_orbbox * self.fcb.M2/self.fcb.M_b
+            self.v2 = np.array([np.cos( np.pi/2*self.fcb.orb_dir + phase), 
+                                np.sin( np.pi/2*self.fcb.orb_dir + phase)]) * self.fcb.v_orbbox * self.fcb.M1/self.fcb.M_b
             self.vb = self.v1 - self.v2
         else:
             self.r1, self.r2, self.v1, self.v2 = self.fcb.get_pos(self.dmdp.t[1:])
