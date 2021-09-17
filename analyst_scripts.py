@@ -1,4 +1,5 @@
 import copy
+from numbers import Number
 import numpy as np
 import numpy.ma as ma
 import scipy as sp
@@ -320,16 +321,25 @@ class FixedCircularBinary:
         self.orb_dir = kwargs.get('orb_dir', 1)
         
         # now correct for the shearing box frame
+        # N.B.: Since we separate orb_dir from Omega_b, here we treat Omega_b as +1 and flip Omega_K.
+        #       However, this is only used to calculate |orbital frequency|.
+        #       Thus, the positions and velocities of the binary are in the frame of Omega_K being positive.
+        #       Consequently, the calculations of inertial velocities still holds.
         self.Omega_bbox = self.Omega_b - self.orb_dir * self.Omega_K
-        if "wrong_frame" in kwargs:
+        if kwargs.get("wrong_frame", False):
             self.Omega_bbox = self.Omega_b # for simulations in wrong frames
+        if "Omega_offset" in kwargs:
+            self.Omega_offset = kwargs.get("Omega_offset")
+            self.Omega_bbox = self.Omega_bbox + self.Omega_offset
+        else:
+            self.Omega_offset = 0
         self.P_bbox = 2*np.pi / self.Omega_bbox # P_bbox is what matters for calculating r and v
         self.v_orbbox = self.Omega_bbox * self.a_b # equiv to 2*np.pi * self.a_b / self.P_bbox
         
         if 'M1' in kwargs and 'M2' in kwargs:
             self.M1, self.M2 = kwargs.get('M1'), kwargs.get('M2')
             self.M1, self.M2 = np.array([self.M1, self.M2]) * self.M_b/(self.M1+self.M2)
-            self.q_b = self.M1 / self.M2
+            self.q_b = self.M1 / self.M2 if self.M1<self.M2 else self.M2 / self.M1
         elif 'q_b' in kwargs: # note that I used M2 as the primary
             self.q_b = kwargs.get('q_b')
             self.M1, self.M2 = self.q_b, 1.0
@@ -339,15 +349,34 @@ class FixedCircularBinary:
             self.M2 = self.M_b / 2
             self.q_b = 1.0
         
+        self.e0_prec = kwargs.get('e0_prec', False) # use this flag to consider precession even if e=0
         self.e = kwargs.get('ecc', 0.0) # eccentricity
+        if self.e != 0.0 and self.e0_prec is True:
+            self.e0_prec = False # ensure the consistency between self.e and self.e0_prec
+            print(f"Warning: e0_prec should only be True for eccentric orbits (given e={self.e:.2e}) and has been reset to False.")
         self.dot_curly_pi = 0.75*(1/3/(self.lam)**3)*np.sqrt(1-self.e**2)
+        self.Omega_b_prime = self.Omega_b + self.dot_curly_pi  - self.orb_dir * self.Omega_K
+        self.P_b_prime = 2 * np.pi / (self.Omega_b + self.dot_curly_pi  - self.orb_dir * self.Omega_K)
         self.num_pool = kwargs.get('Npool', 0)
         
         self.mu_b = self.M1 * self.M2 / self.M_b
-        self.L_0 = self.orb_dir * self.mu_b * np.sqrt(self.M_b * self.a_b * (1 - self.e**2))
-        self.l_0 = self.orb_dir * np.sqrt(self.M_b * self.a_b * (1 - self.e**2))
-        self.E_0 = -self.mu_b * self.M_b / (2*self.a_b)
+        self.l_0 = self.orb_dir * self.Omega_b * self.a_b**2 * np.sqrt(1 - self.e**2)
+        # alternatively, self.l_0 = self.orb_dir * np.sqrt(self.M_b * self.a_b * (1 - self.e**2))
+        self.L_0 = self.mu_b * self.l_0
         self.eth_0 = -self.M_b / (2*self.a_b)
+        # alternatively, self.eth_0 = - self.Omega_b**2 * self.a_b**2
+        self.E_0 = self.mu_b * self.eth_0
+
+        self.debug_flag = kwargs.get("debug", False)
+        if self.debug_flag:
+            if self.e != 0.0 and self.e0_prec is True:
+                self.l_0 = self.orb_dir * (self.Omega_b + self.Omega_offset) * self.a_b**2 * np.sqrt(1 - self.e**2)
+                self.eth_0 = -(self.Omega_b**2 * self.a_b**2) + 0.5*(self.Omega_b + self.Omega_offset)**2 * self.a_b**2
+            else:
+                self.l_0 = self.orb_dir * (self.Omega_b + self.dot_curly_pi) * self.a_b**2 * np.sqrt(1 - self.e**2)
+                self.eth_0 = -(self.Omega_b**2 * self.a_b**2) + 0.5*(self.Omega_b + self.dot_curly_pi)**2 * self.a_b**2
+            self.L_0 = self.mu_b * self.l_0            
+            self.E_0 = self.mu_b * self.eth_0
         
         # initial position and velocity
 
@@ -356,30 +385,61 @@ class FixedCircularBinary:
         # example vector from m2 to m1: r21 = r1 - r2
         # by default, the initial positions of m1 and m2 are on the x-axis and m1 is on the negative side
         self.r_b0 = np.array([self.a_b * (1 - self.e), 0])
-        self.v_b0 = np.array([0, self.orb_dir * self.a_b * np.sqrt((1 + self.e) / (1 - self.e))])
+        self.v_b0 = np.array([0, self.orb_dir * self.Omega_b * self.a_b * np.sqrt((1 + self.e) / (1 - self.e))])
         
         self.update_pos(0)
         
-    def update_pos(self, t):
-        """ update binary's positions and velocities based on the input time (one single time) """
+        # time-averaged strings
+        self.ta_str = {
+            'dot_L' : self.ta_it(r"\dot{L}_{\rm b}"),
+            'dot_m' : self.ta_it(r"\dot{m}_{\rm b}"),
+            'dot_l' : self.ta_it(r"\dot{\ell}_{\rm b}"),
+            'dot_eth' : self.ta_it(r"\dot{\mathcal{E}}_{\rm b}"),
+            'dot_a' : self.ta_it(r"\dot{a}_{\rm b}"),
+            'dot_e2' : self.ta_it(r"\dot{e}_{\rm b}^2"),
+            'dot_e' : self.ta_it(r"\dot{e}_{\rm b}"),
+            'L/m' : self.ta_it(r"\dot{L}_{\rm b}")+r"$/$"+self.ta_it(r"\dot{m}_{\rm b}"),
+            'l0' : "$\ell_0$",
+            'l0c' : "$\ell_{0,\mathrm{crit}}$",
+            'aoa' : self.ta_it(r"\dot{a}_{\rm b}")+r"$/a_{\rm b}$",
+            'mom' : self.ta_it(r"\dot{m}_{\rm b}")+r"$/m_{\rm b}$",
+        }
+        # unit strings
+        self.u_str = {'dot_L' : r" [$\Sigma_\infty v_{\rm b}^2 a_{\rm b}^2$]", 
+                      'dot_m' : r" [$\Sigma_{\infty} v_{\rm b} a_{\rm b}$]",
+                      'dot_l' : r" [$\Sigma_\infty v_{\rm b}^2 a_{\rm b}^2 / m_{\rm b}$]",
+                      'dot_eth' : r" [$\Sigma_\infty v_{\rm b}^3 a_{\rm b} / m_{\rm b}$]",
+                      'l0' : r" [$v_{\rm b} a_{\rm b}$]",
+                      'mom' : r" [" + self.ta_str['mom'] + r"]",
+        }
+        self.unit_str = self.u_str
+        # combined strings
+        self.cb_str = {
+            'dot_m' : self.ta_str['dot_m'] + self.u_str['dot_m'],
+            'dot_L' : self.ta_str['dot_L'] + self.u_str['dot_L'],
+            'dot_l' : self.ta_str['dot_l'] + self.u_str['dot_l'],
+            'dot_eth' : self.ta_str['dot_eth'] + self.u_str['dot_eth'],
+            'L/m' : self.ta_str['L/m'] + self.u_str['l0'],
+            'l0' : self.ta_str['l0'] + self.u_str['l0'],
+            'l0c' : self.ta_str['l0c'] + self.u_str['l0'],
+            'aoa' : self.ta_str['aoa'] + self.u_str['mom'],
+            'dot_e2' : self.ta_str['dot_e2'] + self.u_str['mom'],
+            'dot_e' : self.ta_str['dot_e'] + self.u_str['mom'],
+        }
 
-        if self.e == 0.0:
-            phase = self.orb_dir * 2*np.pi * t / self.P_bbox
-            self.r1 = np.array([np.cos(-np.pi   + phase), np.sin(-np.pi   + phase)]) * self.a_b * self.M2/self.M_b
-            self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]) * self.a_b * self.M1/self.M_b
-            self.v1 = np.array([np.cos(-np.pi/2*self.orb_dir + phase), 
-                                np.sin(-np.pi/2*self.orb_dir + phase)]) * self.v_orbbox * self.M2/self.M_b
-            self.v2 = np.array([np.cos( np.pi/2*self.orb_dir + phase), 
-                                np.sin( np.pi/2*self.orb_dir + phase)]) * self.v_orbbox * self.M1/self.M_b
-        else:
-            tmp_num_pool = self.num_pool
-            self.num_pool = 0
-            _r1, _r2, _v1, _v2 = self.get_pos(np.atleast_1d(t))
-            self.r1, self.r2, self.v1, self.v2 = _r1[0], _r2[0], _v1.T[0], _v2.T[0]
-            self.num_pool = tmp_num_pool
+    def ta_it(self, _s):
+        return r"$\langle" + _s + r"\rangle$"
+        
+    def update_pos(self, t):
+        """ update binary's positions and velocities based on the input time (one single time)
+            N.B.: v1/v2 for circular binaries w/o precession are velocities in the rotating frame
+                  v1/v2 for binaries w/ precession need extra -(Omega_pre x r1/r2) to be in the rotating frame
+        """
+
+        _r1, _r2, _v1, _v2 = self.get_pos(np.atleast_1d(t))
+        self.r1, self.r2, self.v1, self.v2 = _r1[0], _r2[0], _v1.T[0], _v2.T[0]
         self.rb = self.r1 - self.r2
         self.vb = self.v1 - self.v2
-
     
     def FE(self, E, e, M):
         return E-e*np.sin(E)-M
@@ -415,35 +475,51 @@ class FixedCircularBinary:
         return self.M2E(M, self.e, 1e-15)
     
     def get_pos(self, t):
+        """ get binary's positions and velocities based on the input time array and return r_1/2 & v_1/2
+            N.B.: v1/v2 for circular binaries w/o precession are velocities in the rotating frame
+                  v1/v2 for binaries w/ precession need extra -(Omega_pre x r1/r2) to be in the rotating frame
+        """
 
-        M = np.asarray(t)
-        if self.num_pool == 0:
-            E = np.array([self._M2E(m) for m in M])
+        if self.e == 0.0 and self.e0_prec is False:
+            # phase contains orb_dir, no need to include it elsewhere
+            phase = self.orb_dir * 2*np.pi * t / self.P_bbox
+            # transpose to be crossed with f_grav
+            r_1 = np.array([np.cos(-np.pi   + phase), np.sin(-np.pi   + phase)]).T * self.a_b * self.M2/self.M_b
+            r_2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * self.a_b * self.M1/self.M_b
+            # no transpose for v so rb x vb can be done easier
+            v_1 = np.array([np.cos(-np.pi/2*self.orb_dir + phase), 
+                            np.sin(-np.pi/2*self.orb_dir + phase)]) * self.v_orbbox * self.M2/self.M_b
+            v_2 = np.array([np.cos( np.pi/2*self.orb_dir + phase), 
+                            np.sin( np.pi/2*self.orb_dir + phase)]) * self.v_orbbox * self.M1/self.M_b
         else:
-            p = Pool(self.num_pool)
-            E = np.array(p.map(self._M2E, M))
-            p.close()
-            p.join()
-        f_func = 1/(1-self.e) * (np.cos(E) - 1) + 1
-        g_func = M + (np.sin(E) - E)
+            M = np.asarray(t)  # no orb_dir here b/c it already affects v_b0 || note M[0] may not be 0
+            if self.num_pool == 0:
+                E = np.array([self._M2E(m) for m in M])
+            else:
+                p = Pool(self.num_pool)
+                E = np.array(p.map(self._M2E, M))
+                p.close()
+                p.join()
+            f_func = 1/(1-self.e) * (np.cos(E) - 1) + 1
+            g_func = M + (np.sin(E) - E)
 
-        phase_K = self.orb_dir * (self.dot_curly_pi - self.Omega_K) * t
-        # note that this r_b is r2 - r1 but we use r1 - r2 in other calculations
-        r_b = np.array([f_func * np.cos(phase_K) * self.r_b0[0] + g_func * (-np.sin(phase_K)) * self.v_b0[1], 
-                        f_func * np.sin(phase_K) * self.r_b0[0] + g_func * np.cos(phase_K) * self.v_b0[1]]).T
-        # brute force it back to our definition of r1 and r2
-        r_1 = -r_b * self.M2 / self.M_b
-        r_2 = r_b * self.M1 / self.M_b
+            phase_K = (self.orb_dir * self.dot_curly_pi - self.Omega_K) * t
+            # note that this r_b is r2 - r1 but we use r1 - r2 in other calculations
+            r_b = np.array([f_func * np.cos(phase_K) * self.r_b0[0] + g_func * (-np.sin(phase_K)) * self.v_b0[1], 
+                            f_func * np.sin(phase_K) * self.r_b0[0] + g_func * np.cos(phase_K) * self.v_b0[1]]).T
+            # brute force it back to our definition of r1 and r2
+            r_1 = -r_b * self.M2 / self.M_b
+            r_2 = r_b * self.M1 / self.M_b
 
-        r_mag = np.sqrt((r_b**2).sum(axis=1))
-        fprime = -self.a_b/r_mag/(1-self.e) * (np.sin(E - E[0]))
-        gprime = self.a_b/r_mag * (np.cos(E) - 1) + 1
-        # we need v1 - v2, but this v_b is v2 - v1
-        v_b = np.array([fprime * np.cos(phase_K) * self.r_b0[0] + gprime * (-np.sin(phase_K)) * self.v_b0[1],
-                        fprime * np.sin(phase_K) * self.r_b0[0] + gprime * np.cos(phase_K) * self.v_b0[1]])
-        # brute force it back to our definition of v1 and v2
-        v_1 = -v_b * self.M2 / self.M_b
-        v_2 = v_b * self.M1 / self.M_b
+            r_mag = np.sqrt((r_b**2).sum(axis=1))
+            fprime = -self.a_b/r_mag/(1-self.e) * (np.sin(E)) # N.B.: a_b^2 cancelled with r_b0=a_b(1-e) || E[0] is not necessary 0
+            gprime = self.a_b/r_mag * (np.cos(E) - 1) + 1
+            # we need v1 - v2, but this v_b is v2 - v1
+            v_b = np.array([fprime * np.cos(phase_K) * self.r_b0[0] + gprime * (-np.sin(phase_K)) * self.v_b0[1],
+                            fprime * np.sin(phase_K) * self.r_b0[0] + gprime * np.cos(phase_K) * self.v_b0[1]])
+            # brute force it back to our definition of v1 and v2
+            v_1 = -v_b * self.M2 / self.M_b
+            v_2 = v_b * self.M1 / self.M_b
         
         return r_1, r_2, v_1, v_2
 
@@ -453,6 +529,7 @@ class FixedCircularBinary:
                -self.M2 / (np.sqrt((x-self.r2[0])**2 + (y-self.r2[1])**2) + dr_soft*self.a_b) )
         
         return phi
+
 
 class InDiskBinaryParas:
     """ physical parameters for our binary in shearing box simulations """
@@ -477,6 +554,7 @@ class InDiskBinaryParas:
             print(f"{'Omega_K':>24s}{'c_s':>24s}{'P_g':>24s}{'v_0':>24s}{'v_s':>24s}{'R_H':>24s}\n"
                 +f"{self.Omega_K:>24.16e}{self.c_s:>24.16e}{self.P_g:>24.16e}"
                 +f"{self.v_0:>24.16e}{self.v_s:>24.16e}{self.R_H:>24.16e}")
+
 
 class dv_grav:
     def __init__(self, filename, fcb, header=True, **kwargs):
@@ -537,34 +615,7 @@ class dv_grav:
             self.f_grav_2.append(
                 (self._dv_grav_2[t].cumsum(axis=0)[idx_diff::2] 
                  - np.vstack([[0, 0], self._dv_grav_2[t].cumsum(axis=0)[1:-Nf:2]])) / self._2dt[:, np.newaxis] )
-        
-        if kwargs.get("dot_L_take_over", False):
-            return
-        
-        # Below we assume the system is 2D
-        if fcb.e == 0:
-            # phase contains orb_dir, no need to include it elsewhere (the length of phase is 1 smaller than time)
-            phase = fcb.orb_dir * 2*np.pi * self.t[1:] / fcb.P_bbox
-            # transpose to be crossed with f_grav
-            self.r1 = np.array([np.cos(-np.pi   + phase), np.sin(-np.pi   + phase)]).T * fcb.a_b * fcb.M2/fcb.M_b
-            self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * fcb.a_b * fcb.M1/fcb.M_b
-            self.rb = self.r1 - self.r2
-            # no transpose for v so rb x vb can be done easier
-            self.v1 = np.array([np.cos(-np.pi/2*fcb.orb_dir + phase), 
-                                np.sin(-np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M2/fcb.M_b
-            self.v2 = np.array([np.cos( np.pi/2*fcb.orb_dir + phase), 
-                                np.sin( np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M1/fcb.M_b
-            self.vb = self.v1 - self.v2
-        else:
-            self.r1, self.r2, self.v1, self.v2 = fcb.get_pos(self.t[1:])
-            self.rb = self.r1 - self.r2
-            self.vb = self.v1 - self.v2
-        
-        # np.cross treat the last axis as the vector axis (so r1/r2 is transposed)
-        self.dot_l_grav = []; self.dot_L_grav = [];
-        for t in range(Nt):
-            self.dot_l_grav.append(np.cross(self.rb, (self.f_grav_1[t] - self.f_grav_2[t])))
-            self.dot_L_grav.append(fcb.mu_b * self.dot_l_grav[-1])
+
 
 class dmdp_acc:
     
@@ -608,55 +659,13 @@ class dmdp_acc:
 
         self.t, self.dt = self.data[:, :2].T
         self.mdot = []; self.mdot_tot = []; self.pdot = []; self.Fpres = []; 
-        #self.Facc = []
         for idx_r in range(num_r_ev):
             self.mdot.append(self.data[:, 2+idx_r*num_col_set:4+idx_r*num_col_set].T)
             self.mdot_tot.append(self.mdot[-1][0] + self.mdot[-1][1])
             self.pdot.append(self.data[:, 4+idx_r*num_col_set:10+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
             self.Fpres.append(self.data[:, 10+idx_r*num_col_set:16+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
-            
-            # Facc below only makes sense in inertial frames; there are extra calculations for rotating frames
-            #self.Facc.append(self.pdot[-1] + self.Fpres[-1])
 
-        if kwargs.get("dot_L_take_over", False):
-            return
-        
-        # Below we assume the system is 2D
-        if fcb.e == 0:
-            # phase contains orb_dir, no need to include it elsewhere (the length of phase is 1 smaller than time)
-            phase = fcb.orb_dir * 2*np.pi * self.t[1:] / fcb.P_bbox
-            # transpose to be crossed with f_grav
-            self.r1 = np.array([np.cos(-np.pi   + phase), np.sin(-np.pi   + phase)]).T * fcb.a_b * fcb.M2/fcb.M_b
-            self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * fcb.a_b * fcb.M1/fcb.M_b
-            self.rb = self.r1 - self.r2
-            # no transpose for v so rb x vb can be done easier
-            self.v1 = np.array([np.cos(-np.pi/2*fcb.orb_dir + phase), 
-                                np.sin(-np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M2/fcb.M_b
-            self.v2 = np.array([np.cos( np.pi/2*fcb.orb_dir + phase), 
-                                np.sin( np.pi/2*fcb.orb_dir + phase)]) * fcb.v_orbbox * fcb.M1/fcb.M_b
-            self.vb = self.v1 - self.v2
-        else:
-            self.r1, self.r2, self.v1, self.v2 = fcb.get_pos(self.t[1:])
-            self.rb = self.r1 - self.r2
-            self.vb = self.v1 - self.v2
 
-        # only calculate quantities for t[1:] to match data in dv_grav
-        self.facc1 = []; self.facc2 = []; self.fpres1 = []; self.fpres2 = []
-        #self.dot_L_dp_acc = []; self.dot_L_fp_acc = []; self.dot_L_acc = []
-        for idx_r in range(num_r_ev):
-            self.facc1.append((self.pdot[idx_r][0][:2, 1:] - self.mdot[idx_r][0][1:] * self.v1) / fcb.M1)
-            self.facc2.append((self.pdot[idx_r][1][:2, 1:] - self.mdot[idx_r][1][1:] * self.v2) / fcb.M2)
-            self.fpres1.append(self.Fpres[idx_r][0][:2, 1:] / fcb.M1)
-            self.fpres2.append(self.Fpres[idx_r][1][:2, 1:] / fcb.M2)
-
-            # dot_L_xxx below only make sense in inertial frames; there are extra calculations for rotating frames
-            #self.dot_L_dp_acc.append(np.cross(self.r1, self.pdot[idx_r][0][:2, 1:].T) 
-            #                         + np.cross(self.r2, self.pdot[idx_r][1][:2, 1:].T))
-            #self.dot_L_fp_acc.append(np.cross(self.r1, self.Fpres[idx_r][0][:2, 1:].T) 
-            #                         + np.cross(self.r2, self.Fpres[idx_r][1][:2, 1:].T))
-            #self.dot_L_acc.append(np.cross(self.r1, self.Facc[idx_r][0][:2, 1:].T)
-            #                      + np.cross(self.r2, self.Facc[idx_r][1][:2, 1:].T))
-        
 class dot_L:
     
     def __init__(self, q, h, lambda_prime, data_dir, r_ev, **kwargs):
@@ -686,33 +695,38 @@ class dot_L:
             raise ValueError("self.dmdp.num_r_ev != self.dv.Nt")
 
         # Below we assume the system is 2D and calculate binary's positions/velocities and their inertial velocities
-        if self.fcb.e == 0:
-            # phase contains orb_dir, no need to include it elsewhere (the length of phase is 1 smaller than time)
-            phase = self.fcb.orb_dir * 2*np.pi * self.dmdp.t[1:] / self.fcb.P_bbox
-            # transpose to be crossed with f_grav
-            self.r1 = np.array([np.cos(-np.pi   + phase), np.sin(-np.pi   + phase)]).T * self.fcb.a_b * self.fcb.M2/self.fcb.M_b
-            self.r2 = np.array([np.cos(     0   + phase), np.sin(     0   + phase)]).T * self.fcb.a_b * self.fcb.M1/self.fcb.M_b
-            self.rb = self.r1 - self.r2
-            # no transpose for v so rb x vb can be done easier
-            self.v1 = np.array([np.cos(-np.pi/2*self.fcb.orb_dir + phase), 
-                                np.sin(-np.pi/2*self.fcb.orb_dir + phase)]) * self.fcb.v_orbbox * self.fcb.M2/self.fcb.M_b
-            self.v2 = np.array([np.cos( np.pi/2*self.fcb.orb_dir + phase), 
-                                np.sin( np.pi/2*self.fcb.orb_dir + phase)]) * self.fcb.v_orbbox * self.fcb.M1/self.fcb.M_b
-            self.vb = self.v1 - self.v2
+        self.r1, self.r2, self.v1, self.v2 = self.fcb.get_pos(self.dmdp.t[1:])
+        self.rb = self.r1 - self.r2
+        if self.fcb.e == 0 and self.fcb.e0_prec is False:
+            self.vb = self.v1 - self.v2  # we don't really use this quantity
+            # the cross product here assumes that the z-component of r1/2 is 0
+            if not self.fcb.debug_flag:
+                self.v1_inertial = self.v1 + np.cross(np.array([0, 0, self.fcb.Omega_K - self.fcb.orb_dir * self.fcb.Omega_offset]), self.r1)[:, :2].T
+                self.v2_inertial = self.v2 + np.cross(np.array([0, 0, self.fcb.Omega_K - self.fcb.orb_dir * self.fcb.Omega_offset]), self.r2)[:, :2].T
+            else:
+                self.v1_inertial = self.v1 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.r1)[:, :2].T
+                self.v2_inertial = self.v2 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.r2)[:, :2].T
         else:
-            self.r1, self.r2, self.v1, self.v2 = self.fcb.get_pos(self.dmdp.t[1:])
-            self.rb = self.r1 - self.r2
-            self.vb = self.v1 - self.v2
+            # we calculate the velocity based on the perspective of the inertial frame
+            self.v1_inertial = self.v1
+            self.v2_inertial = self.v2
+            # thus, we need to put it back to the rotating frame -- this has been validated via trajectories
+            self.v1 = self.v1_inertial - np.cross(np.array([0, 0, self.fcb.Omega_K - self.fcb.orb_dir * self.fcb.dot_curly_pi]), self.r1)[:, :2].T
+            self.v2 = self.v2_inertial - np.cross(np.array([0, 0, self.fcb.Omega_K - self.fcb.orb_dir * self.fcb.dot_curly_pi]), self.r2)[:, :2].T
+            self.vb = self.v1 - self.v2  # we don't really use this quantity
+            # what if we need to account for the physical precession? not sure for now
+            if self.fcb.debug_flag:
+                self.v1_inertial -= np.cross(np.array([0, 0, - self.fcb.dot_curly_pi]), self.r1)[:, :2].T
+                self.v2_inertial -= np.cross(np.array([0, 0, - self.fcb.dot_curly_pi]), self.r2)[:, :2].T
+
         """ From Dong's discussions: r_b is the same, regardless of the reference frame, but x-y decomposition is different in 
             different frames. On the contrary, v_b is different, but can be connected to do inertial frame calculations:
             v_b = v_b' + Omega_K x r_b'
             which is very different than the direct computation from phase: v_b(t) = Omega_b x r_b(t)
         """
-        self.v1_inertial = self.v1 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.r1)[:, :2].T
-        self.v2_inertial = self.v2 + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.r2)[:, :2].T
         self.vb_inertial = self.v1_inertial - self.v2_inertial
         # alternatively, this can be done through 
-        #   self.dv.vb + np.cross(np.array([0, 0, self.fcb.Omega_K]), self.dv.rb)[:, :2].T
+        #   self.vb + np.cross(np.array([0, 0, Omega_precession]), self.rb)[:, :2].T
         # which may differ on the order of machine precision
         
         # only calculate quantities for t[1:] to match data in self.dv_grav
@@ -761,6 +775,12 @@ class dot_L:
         self.e2dot = []
         for idx_r in range(self.dmdp.num_r_ev):
             self.adot_oa_eth.append(self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0))
+            # calculate everything when e0_prec is True
+            if self.fcb.e > 0.0 or self.fcb.e0_prec is True:
+                self.e2dot.append((2 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0) 
+                                   - 2 * (self.dot_l_tot[idx_r] / self.fcb.l_0)) * (1 - self.fcb.e**2))
+                if self.fcb.e > 0.0:
+                    self.adot_oa_l.append(None); self.adot_oa_L.append(None)
             if self.fcb.e == 0.0:
                 self.adot_oa_l.append(2 * self.dot_l_tot[idx_r] / self.fcb.l_0 - self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
                 if self.fcb.q_b == 1.0:
@@ -768,14 +788,47 @@ class dot_L:
                 else:
                     self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 + self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b
                                         - 2 * self.dmdp.mdot[idx_r][0, 1:] / self.fcb.M1 - 2 * self.dmdp.mdot[idx_r][1, 1:] / self.fcb.M2)
-            else:
-                self.adot_oa_l.append(None); self.adot_oa_L.append(None)
-                self.e2dot.append((2 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0) 
-                                   - 2 * (self.dot_l_tot[idx_r] / self.fcb.l_0)) * (1 - self.fcb.e**2))
-                #if self.fcb.q_b == 1.0:
-                #    pass    
-                #else:
-                #    raise NotImplementedError("The analysis code for e>0 and q_b<1 hasn't been implemented yet...")
+
+        # convenient strings
+        self.ta_str = self.fcb.ta_str
+        self.unit_str = self.fcb.unit_str
+        self.cb_str = self.fcb.cb_str
+
+    def basic_results(self, t0mean, rmean, idx_r = 0, breakdown=False, header=True):
+        self.rmean_t = rmean(self.dv.t[1:])
+        self.idx_dvt = self.dv.t[1:] > t0mean
+        self.idx_dmdpt = self.dmdp.t > t0mean
+        self.dt_sum = (self.dv.dt[1:])[self.idx_dvt].sum()
+        self.dtmean = lambda q : (q * self.dmdp.dt[1:])[self.idx_dvt].sum() / self.dt_sum
+        self.mean_dot_m_tot = self.dtmean(self.dmdp.mdot_tot[idx_r][1:])
+        self.mean_dot_L_tot = self.dtmean(self.dot_L_tot[idx_r])
+        self.mean_dot_eth = self.dtmean(self.dot_eth[idx_r])
+
+        if header:
+            h_str = f"{'<dot_m>':>18s}{'<dot_eth>':>18s}{'<dot_l>':>18s}{'<dot_L>':>18s}{'<dot_L>/<dot_m>':>18s}{'<dot_a>/a[dotM/M]':>18s}"
+            if self.fcb.e > 0 or self.fcb.e0_prec is True:
+                h_str += f"{'<dot_e^2>[dotM/M]':>18s}"
+            #if self.fcb.q_b < 1:
+            h_str += f"{'<eta>':>18s}"
+            if breakdown:
+                h_str += f"{'<dot_L_grav>':>18s}{'<dot_L_acc>':>18s}{'<dot_L_pres>':>18s}{'<dot_L_mu_b>':>18s}"
+            print(h_str)
+        
+        q_str = f"{ self.mean_dot_m_tot :>18.10e}{ self.mean_dot_eth :>18.10e}" \
+                f"{ self.dtmean(self.dot_l_tot[idx_r]) :>18.10e}{ self.mean_dot_L_tot :>18.10e}" \
+              + f"{ self.dtmean(self.dot_L_tot[idx_r]) / self.mean_dot_m_tot :>18.10e}" \
+              + f"{ self.dtmean(self.adot_oa_eth[idx_r]) / self.mean_dot_m_tot :>18.10e}"
+        if self.fcb.e > 0 or self.fcb.e0_prec is True:
+            q_str += f"{ self.dtmean(self.e2dot[idx_r]) / self.mean_dot_m_tot :>18.10e}"
+        #if self.fcb.q_b < 1:
+        if self.fcb.M1 <= self.fcb.M2:
+            q_str += f"{self.dtmean(self.dmdp.mdot[idx_r][0, 1:]) / self.mean_dot_m_tot :>18.10e}"
+        if self.fcb.M2 < self.fcb.M1:
+            q_str += f"{self.dtmean(self.dmdp.mdot[idx_r][1, 1:]) / self.mean_dot_m_tot :>18.10e}"
+        if breakdown:
+            q_str += f"{ self.dtmean(self.dot_L_grav[idx_r]) :>18.10e}{ self.dtmean(self.dot_L_acc[idx_r]) :>18.10e}" \
+                  + f"{ self.dtmean(self.dot_L_pres[idx_r]) :>18.10e}{ self.dtmean(self.dot_L_mu_b[idx_r]) :>18.10e}"
+        print(q_str)
 
 
 # ******************************************************************************
