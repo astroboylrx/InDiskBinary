@@ -69,7 +69,7 @@ def single_frame_Q(b, figsize=(8.5, 7), **kwargs):
         im = ax.pcolor(a.ccx/fcb.a_b, a.ccy/fcb.a_b, scale_func(a[Q]), shading='auto', vmin=vmin, vmax=vmax, cmap=kwargs.get("cmap", 'RdBu_r'))
     ax.set(aspect=1.0, xlabel=r"$x/a_{\rm b}$", ylabel=r"$y/a_{\rm b}$", 
            title=kwargs.get("preTitle", '')+r"$t="+f"{a.t/fcb.P_b:.2f}"+r"P_{\rm bin}$")
-    cax = rxplt.add_aligned_colorbar(fig, ax, im, size='3%'); cax.ax.set_ylabel(kwargs.get('cax_ylabel', "$\log_{10}(\Sigma/\Sigma_0)$"))
+    cax = rxplt.add_aligned_colorbar(fig, ax, im, size='3%'); cax.ax.set_ylabel(kwargs.get('cax_ylabel', "$\log_{10}(\Sigma/\Sigma_\infty)$"))
     fig.tight_layout();
     return fig, ax
 
@@ -81,19 +81,22 @@ def single_frame_zoomcenter_Q_no_fcb(b, figsize=(13.5, 6.5), **kwargs):
     else:
         scale_func = kwargs.get("scale_func", lambda x : x[Q])
     for idx_lev, a in enumerate(b):
-        im = ax[0].pcolor(a.ccx, a.ccy, scale_func(a), shading='auto', vmin=kwargs.get("vmin", scale_func(b[-1]).min()*1.1), vmax=kwargs.get("vmax", scale_func(b[-1]).max()*0.95), cmap=kwargs.get("cmap", 'RdBu_r'), rasterized=kwargs.get("rasterized", None))
-        im = ax[1].pcolor(a.ccx, a.ccy, scale_func(a), shading='auto', vmin=kwargs.get("vmin", scale_func(b[-1]).min()*1.1), vmax=kwargs.get("vmax", scale_func(b[-1]).max()*0.95), cmap=kwargs.get("cmap", 'RdBu_r'), rasterized=kwargs.get("rasterized", None))
+        im = ax[0].imshow(scale_func(a), vmin=kwargs.get("vmin", scale_func(b[-1]).min()*1.1), vmax=kwargs.get("vmax", scale_func(b[-1]).max()*0.95), cmap=kwargs.get("cmap", 'RdBu_r'), rasterized=kwargs.get("rasterized", None), interpolation='none', extent=[a.box_min[0], a.box_max[0], a.box_min[1], a.box_max[1]], origin='lower')
+        im = ax[1].imshow(scale_func(a), vmin=kwargs.get("vmin", scale_func(b[-1]).min()*1.1), vmax=kwargs.get("vmax", scale_func(b[-1]).max()*0.95), cmap=kwargs.get("cmap", 'RdBu_r'), rasterized=kwargs.get("rasterized", None), interpolation='none', extent=[a.box_min[0], a.box_max[0], a.box_min[1], a.box_max[1]], origin='lower')
+        #im = ax[0].pcolor(a.ccx, a.ccy, scale_func(a), shading='auto', vmin=kwargs.get("vmin", scale_func(b[-1]).min()*1.1), vmax=kwargs.get("vmax", scale_func(b[-1]).max()*0.95), cmap=kwargs.get("cmap", 'RdBu_r'), rasterized=kwargs.get("rasterized", None))
+        #im = ax[1].pcolor(a.ccx, a.ccy, scale_func(a), shading='auto', vmin=kwargs.get("vmin", scale_func(b[-1]).min()*1.1), vmax=kwargs.get("vmax", scale_func(b[-1]).max()*0.95), cmap=kwargs.get("cmap", 'RdBu_r'), rasterized=kwargs.get("rasterized", None))
     ax[0].set(aspect=kwargs.get("aspect", 1), xlabel=r"$x$"+kwargs.get("len_units", ""), ylabel=r"$y$"+kwargs.get("len_units", ""), 
               title=kwargs.get("preTitle", '')+r"$t="+f"{a.t:.2f}$")
     ax[1].set(aspect=kwargs.get("zoom_aspect", 1), xlabel=r"$x$"+kwargs.get("len_units", ""), xlim=(-zl, zl), ylim=(-zl, zl), title=r"Zooming in center")
-    cax = rxplt.add_aligned_colorbar(fig, ax[1], im, size='3%'); cax.ax.set_ylabel(kwargs.get('cax_ylabel', "$\log_{10}(\Sigma/\Sigma_0)$"))
+    cax = rxplt.add_aligned_colorbar(fig, ax[1], im, size='3%'); cax.ax.set_ylabel(kwargs.get('cax_ylabel', "$\log_{10}(\Sigma/\Sigma_\infty)$"))
     fig.tight_layout(); fig.subplots_adjust(wspace=kwargs.get("wspace", 0.1))
     return fig, ax
 
 def single_frame_zoomcenter_Q_no_fcb_stream(b, figsize=(13.5, 6.5), **kwargs):
     fig, ax = single_frame_zoomcenter_Q_no_fcb(b, figsize=figsize, **kwargs)
     lev = 0
-    ax[0].streamplot(b[lev].ccx, b[lev].ccy, (b[lev]['ux']/b[lev]['rhog']), (b[lev]['uy']/b[lev]['rhog']), color='lime')
+    ax[0].streamplot(b[lev].ccx, b[lev].ccy, (b[lev]['ux']/b[lev]['rhog']), (b[lev]['uy']/b[lev]['rhog']), 
+                     density=kwargs.get("stream_density", 1), color=kwargs.get('stream_color','lime'))
     ax[0].set_xlim([b[0].box_min[0], b[0].box_max[0]]); ax[0].set_ylim([b[0].box_min[1], b[0].box_max[1]]) # sometimes white space appears
     lev = kwargs.get("zoom_stream_level", -2)
     if kwargs.get('fcb', None) is not None:
@@ -105,9 +108,9 @@ def single_frame_zoomcenter_Q_no_fcb_stream(b, figsize=(13.5, 6.5), **kwargs):
         ux[dist2m1 < r_sink] = np.nan; uy[dist2m1 < r_sink] = np.nan
         dist2m2 = ((ccx - fcb.r2[0])**2 + (ccy - fcb.r2[1])**2)**(1/2)
         ux[dist2m2 < r_sink] = np.nan; uy[dist2m2 < r_sink] = np.nan
-        ax[1].streamplot(b[lev].ccx, b[lev].ccy, ux, uy, density=kwargs.get("zoom_stream_density", 1.5), color='lime')
+        ax[1].streamplot(b[lev].ccx, b[lev].ccy, ux, uy, density=kwargs.get("zoom_stream_density", 1.5), color=kwargs.get('stream_color','lime'))
     else:
-        ax[1].streamplot(b[lev].ccx, b[lev].ccy, (b[lev]['ux']/b[lev]['rhog']), (b[lev]['uy']/b[lev]['rhog']), density=kwargs.get("zoom_stream_density", 1.5), color='lime')
+        ax[1].streamplot(b[lev].ccx, b[lev].ccy, (b[lev]['ux']/b[lev]['rhog']), (b[lev]['uy']/b[lev]['rhog']), density=kwargs.get("zoom_stream_density", 1.5), color=kwargs.get('stream_color','lime'))
     return fig, ax
 
 def single_frame_zoomcenter_Q_no_fcb_quiver(b, figsize=(13.5, 6.5), **kwargs):
@@ -142,7 +145,7 @@ def single_frame_zoomcenter_Q(b, figsize=(13.5, 6.5), **kwargs):
         im = ax[1].pcolor(a.ccx/fcb.a_b, a.ccy/fcb.a_b, scale_func(a), shading='auto', vmin=vmin, vmax=vmax, cmap=kwargs.get("cmap", 'RdBu_r'))
     ax[0].set(aspect=1.0, xlabel=r"$x/a_{\rm b}$", ylabel=r"$y/a_{\rm b}$", title=kwargs.get("preTitle", '')+r"$t="+f"{a.t/fcb.P_b:.2f}"+r"P_{\rm bin}$")
     ax[1].set(aspect=1.0, xlabel=r"$x/a_{\rm b}$", xlim=(-zl, zl), ylim=(-zl, zl), title=r"Zooming in center")
-    cax = rxplt.add_aligned_colorbar(fig, ax[1], im, size='3%'); cax.ax.set_ylabel(kwargs.get('cax_ylabel', "$\log_{10}(\Sigma/\Sigma_0)$"))
+    cax = rxplt.add_aligned_colorbar(fig, ax[1], im, size='3%'); cax.ax.set_ylabel(kwargs.get('cax_ylabel', "$\log_{10}(\Sigma/\Sigma_\infty)$"))
     fig.tight_layout(); fig.subplots_adjust(wspace=kwargs.get("wspace", 0.04))
     return fig, ax
 
@@ -664,6 +667,52 @@ class dmdp_acc:
             self.mdot_tot.append(self.mdot[-1][0] + self.mdot[-1][1])
             self.pdot.append(self.data[:, 4+idx_r*num_col_set:10+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
             self.Fpres.append(self.data[:, 10+idx_r*num_col_set:16+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
+            
+
+class dmdp_acc_Bondi_SB:
+    
+    def __init__(self, filename, fcb, header=True, **kwargs):
+
+        f = open(filename, 'rb')
+        if header:
+            tmp_line = f.readline()
+            num_r_ev = int(tmp_line)
+        else:
+            num_r_ev = kwargs.get("num_r_ev", 1)
+        self.num_r_ev = num_r_ev
+        num_col_set = (2 + 6 + 3 + 3) # time, dt, dm_acc[2], dp_acc[2][3], f_pres_1[3], f_pres_2[3]
+        self.num_col_set = num_col_set
+        self.data_per_row = 2 + num_col_set * num_r_ev
+
+        pos_i = f.tell(); f.seek(0, 2); num_bytes = f.tell() - pos_i
+        self.num_rows = num_bytes // 8 // self.data_per_row
+        if self.num_rows * 8 * self.data_per_row > num_bytes:
+            raise IOError(f"The number of bytes seems off: rows={self.num_rows}, num_bytes={self.num_bytes}")
+        elif self.num_rows * 8 * self.data_per_row < num_bytes:
+            print(f"Bytes more than data: rows={self.num_rows}, num_bytes={num_bytes}; reading anyway")
+            self.num_rows -= 1 # something must be off in the end, let's be safe
+        else:
+            pass
+        
+        row_limit = kwargs.get("row_limit", None)
+        if row_limit is None:
+            f.close()
+            return
+        else:
+            if self.num_rows >= row_limit: # good to check again
+                self.num_rows = row_limit
+            else:
+                f.close()
+                raise ValueError("row_limit larger than available num_rows")
+        
+        f.seek(pos_i, 0)
+        data = rxu.loadbin(f, num=self.num_rows*self.data_per_row).reshape([self.num_rows, self.data_per_row]);
+        f.close()
+
+        self.t, self.dt = data[:, :2].T
+        self.mdot = []
+        for idx_r in range(num_r_ev):
+            self.mdot.append(data[:, 2+idx_r*num_col_set:3+idx_r*num_col_set].T)
 
 
 class dot_L:
@@ -794,10 +843,10 @@ class dot_L:
         self.unit_str = self.fcb.unit_str
         self.cb_str = self.fcb.cb_str
 
-    def basic_results(self, t0mean, rmean, idx_r = 0, breakdown=False, header=True):
+    def basic_results(self, t0mean, rmean, idx_r = 0, breakdown=False, header=True, **kwargs):
         self.rmean_t = rmean(self.dv.t[1:])
-        self.idx_dvt = self.dv.t[1:] > t0mean
-        self.idx_dmdpt = self.dmdp.t > t0mean
+        self.idx_dvt = kwargs.get("idx_dvt", self.dv.t[1:] > t0mean)
+        self.idx_dmdpt = kwargs.get("idx_dmdpt", self.dmdp.t > t0mean)
         self.dt_sum = (self.dv.dt[1:])[self.idx_dvt].sum()
         self.dtmean = lambda q : (q * self.dmdp.dt[1:])[self.idx_dvt].sum() / self.dt_sum
         self.mean_dot_m_tot = self.dtmean(self.dmdp.mdot_tot[idx_r][1:])
@@ -921,5 +970,9 @@ class DatManipulator:
 class GasHistory:
     def __init__(self, hst_filepath):
         gas_hst_scalars = np.loadtxt(hst_filepath)
-        self.time, self.dt, self.mass, self.E, self.Mx, self.My, self.Mz, \
-            self.KEx, self.KEy, self.KEz, self.RhoVxdVy, self.rhodVy2, self.ErhoPhi = gas_hst_scalars.T
+        try:
+            self.time, self.dt, self.mass, self.E, self.Mx, self.My, self.Mz, \
+                self.KEx, self.KEy, self.KEz, self.RhoVxdVy, self.rhodVy2, self.ErhoPhi = gas_hst_scalars.T
+        except ValueError:
+            self.time, self.dt, self.mass, self.Mx, self.My, self.Mz, \
+                self.KEx, self.KEy, self.KEz, self.RhoVxdVy, self.rhodVy2 = gas_hst_scalars.T
