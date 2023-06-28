@@ -1,4 +1,6 @@
 import copy
+import os
+from pathlib import Path
 from numbers import Number
 import numpy as np
 import numpy.ma as ma
@@ -638,16 +640,38 @@ class dmdp_acc:
         pos_i = f.tell(); f.seek(0, 2); num_bytes = f.tell() - pos_i
         self.num_rows = num_bytes // 8 // self.data_per_row
         if self.num_rows * 8 * self.data_per_row > num_bytes:
-            raise IOError(f"The number of bytes seems off: rows={self.num_rows}, num_bytes={self.num_bytes}")
+            raise IOError(f"The number of bytes seems off: rows={self.num_rows}, num_bytes={num_bytes}")
         elif self.num_rows * 8 * self.data_per_row < num_bytes:
             print(f"Bytes more than data: rows={self.num_rows}, num_bytes={num_bytes}; reading anyway")
             self.num_rows -= 1 # something must be off in the end, let's be safe
         else:
             pass
+
+        if kwargs.get("read_spin", False):
+            self.spin_flag = True
+            fs = open(os.path.dirname(filename) + '/' + kwargs.get("spin_filename", "dp_spin.dat"), 'rb');
+            fs.seek(pos_i, 0)
+            
+            data_per_row_spin = 2 * num_r_ev
+            fs.seek(0, 2); num_bytes = fs.tell() - pos_i
+            num_rows_spin = num_bytes // 8 // data_per_row_spin
+            if num_rows_spin * 8 * data_per_row_spin > num_bytes:
+                raise IOError(f"The number of bytes seems off in spin data: rows={num_rows_spin}, num_bytes={num_bytes}")
+            elif num_rows_spin * 8 * data_per_row_spin < num_bytes:
+                print(f"Bytes more than data in spin data: rows={num_rows_spin}, num_bytes={num_bytes}; reading anyway")
+                num_rows_spin -= 1 # something must be off in the end, let's be safe
+                if num_rows_spin < self.num_rows:
+                    self.num_rows = num_rows_spin
+            else:
+                pass
+        else:
+            self.spin_flag = False
         
         row_limit = kwargs.get("row_limit", None)
         if row_limit is None:
             f.close()
+            if self.spin_flag:
+                fs.close()
             return
         else:
             if self.num_rows >= row_limit: # good to check again
@@ -659,6 +683,15 @@ class dmdp_acc:
         f.seek(pos_i, 0)
         self.data = rxu.loadbin(f, num=self.num_rows*self.data_per_row).reshape([self.num_rows, self.data_per_row]);
         f.close()
+        if kwargs.get("read_spin", False):
+            self.spin_flag = True
+            f = open(os.path.dirname(filename) + '/' + kwargs.get("spin_filename", "dp_spin.dat"), 'rb');
+            f.seek(pos_i, 0)
+            self.spin_data = rxu.loadbin(f, num=self.num_rows * 2 * num_r_ev).reshape([self.num_rows, 2 * num_r_ev]);
+            f.close()
+            self.Sdot = []
+        else:
+            self.spin_flag = False
 
         self.t, self.dt = self.data[:, :2].T
         self.mdot = []; self.mdot_tot = []; self.pdot = []; self.Fpres = []; 
@@ -667,7 +700,9 @@ class dmdp_acc:
             self.mdot_tot.append(self.mdot[-1][0] + self.mdot[-1][1])
             self.pdot.append(self.data[:, 4+idx_r*num_col_set:10+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
             self.Fpres.append(self.data[:, 10+idx_r*num_col_set:16+idx_r*num_col_set].T.reshape([2, 3, self.num_rows]))
-            
+            if self.spin_flag:
+                self.Sdot.append(self.spin_data[:, idx_r*2:2+idx_r*2].T)
+
 
 class dmdp_acc_Bondi_SB:
     
@@ -728,23 +763,31 @@ class dot_L:
         if not kwargs.get('prefix', False):
             data_dir = data_dir + "/"
         
-        # in case the simulation is ongoing and two data files have different cycles
-        max_row_dmdp = dmdp_acc(data_dir + "dmdp_acc.dat", self.fcb, **kwargs.get("dmdp_kw", {})).num_rows
         max_row_dv = dv_grav(data_dir + "dv_grav.dat", self.fcb, **kwargs.get("dv_kw", {})).num_rows
-        if max_row_dmdp == max_row_dv:
-            max_row = max_row_dmdp
+        self.dmdp_acc_exist = Path(data_dir + "dmdp_acc.dat").is_file()
+        # in case the simulation is ongoing and two data files have different cycles
+        if self.dmdp_acc_exist:
+            max_row_dmdp = dmdp_acc(data_dir + "dmdp_acc.dat", self.fcb, **kwargs.get("dmdp_kw", {})).num_rows
+            if max_row_dmdp == max_row_dv:
+                max_row = max_row_dmdp
+            else:
+                max_row = min(max_row_dmdp, max_row_dv) - 1
+                print("using the most compatible max_row = ", max_row)
         else:
-            max_row = min(max_row_dmdp, max_row_dv) - 1
-            print("using the most compatible max_row = ", max_row)
-            
-        self.dmdp = dmdp_acc(data_dir + "dmdp_acc.dat", self.fcb, row_limit=max_row, dot_L_take_over=True,  **kwargs.get("dmdp_kw", {}))
+            max_row = max_row_dv
+            print("dmdp_acc.dat not exist; using the most compatible max_row_dv = ", max_row)
+
         self.dv = dv_grav(data_dir + "dv_grav.dat", self.fcb, row_limit=max_row, dot_L_take_over=True, **kwargs.get("dv_kw", {}))
-        
-        if self.dmdp.num_r_ev != self.dv.Nt:
-            raise ValueError("self.dmdp.num_r_ev != self.dv.Nt")
+        if self.dmdp_acc_exist:
+            self.dmdp = dmdp_acc(data_dir + "dmdp_acc.dat", self.fcb, row_limit=max_row, dot_L_take_over=True,  **kwargs.get("dmdp_kw", {}))
+            self.spin_flag = self.dmdp.spin_flag
+            if self.dmdp.num_r_ev != self.dv.Nt:
+                raise ValueError("self.dmdp.num_r_ev != self.dv.Nt")
+        else:
+            self.spin_flag = False
 
         # Below we assume the system is 2D and calculate binary's positions/velocities and their inertial velocities
-        self.r1, self.r2, self.v1, self.v2 = self.fcb.get_pos(self.dmdp.t[1:])
+        self.r1, self.r2, self.v1, self.v2 = self.fcb.get_pos(self.dv.t[1:])
         self.rb = self.r1 - self.r2
         if self.fcb.e == 0 and self.fcb.e0_prec is False:
             self.vb = self.v1 - self.v2  # we don't really use this quantity
@@ -778,26 +821,27 @@ class dot_L:
         #   self.vb + np.cross(np.array([0, 0, Omega_precession]), self.rb)[:, :2].T
         # which may differ on the order of machine precision
         
-        # only calculate quantities for t[1:] to match data in self.dv_grav
-        self.facc1 = []; self.facc2 = []; self.fpres1 = []; self.fpres2 = []
-        for idx_r in range(self.dmdp.num_r_ev):
-            self.facc1.append((self.dmdp.pdot[idx_r][0][:2, 1:] - self.dmdp.mdot[idx_r][0][1:] * self.v1) / self.fcb.M1)
-            self.facc2.append((self.dmdp.pdot[idx_r][1][:2, 1:] - self.dmdp.mdot[idx_r][1][1:] * self.v2) / self.fcb.M2)
-            self.fpres1.append(self.dmdp.Fpres[idx_r][0][:2, 1:] / self.fcb.M1)
-            self.fpres2.append(self.dmdp.Fpres[idx_r][1][:2, 1:] / self.fcb.M2)
-        # specific torques
-        self.facc_1m2 = []; self.fpres_1m2 = [];
-        self.dot_l_acc = []; self.dot_l_pres = []; self.dot_L_acc = []; self.dot_L_pres = []
-        self.dot_eth_acc = []; self.dot_eth_pres = []
-        for idx_r in range(self.dmdp.num_r_ev):
-            self.facc_1m2.append(self.facc1[idx_r] - self.facc2[idx_r])
-            self.fpres_1m2.append(self.fpres1[idx_r] - self.fpres2[idx_r])
-            self.dot_l_acc.append(np.cross(self.rb, (self.facc_1m2[-1]).T))
-            self.dot_l_pres.append(np.cross(self.rb, (self.fpres_1m2[-1]).T))
-            self.dot_L_acc.append(self.fcb.mu_b * self.dot_l_acc[-1])
-            self.dot_L_pres.append(self.fcb.mu_b * self.dot_l_pres[-1])
-            self.dot_eth_acc.append(np.sum(self.vb_inertial * self.facc_1m2[-1], axis=0))
-            self.dot_eth_pres.append(np.sum(self.vb_inertial * self.fpres_1m2[-1], axis=0))
+        if self.dmdp_acc_exist:
+            # only calculate quantities for t[1:] to match data in self.dv_grav
+            self.facc1 = []; self.facc2 = []; self.fpres1 = []; self.fpres2 = []
+            for idx_r in range(self.dmdp.num_r_ev):
+                self.facc1.append((self.dmdp.pdot[idx_r][0][:2, 1:] - self.dmdp.mdot[idx_r][0][1:] * self.v1) / self.fcb.M1)
+                self.facc2.append((self.dmdp.pdot[idx_r][1][:2, 1:] - self.dmdp.mdot[idx_r][1][1:] * self.v2) / self.fcb.M2)
+                self.fpres1.append(self.dmdp.Fpres[idx_r][0][:2, 1:] / self.fcb.M1)
+                self.fpres2.append(self.dmdp.Fpres[idx_r][1][:2, 1:] / self.fcb.M2)
+            # specific torques
+            self.facc_1m2 = []; self.fpres_1m2 = [];
+            self.dot_l_acc = []; self.dot_l_pres = []; self.dot_L_acc = []; self.dot_L_pres = []
+            self.dot_eth_acc = []; self.dot_eth_pres = []
+            for idx_r in range(self.dmdp.num_r_ev):
+                self.facc_1m2.append(self.facc1[idx_r] - self.facc2[idx_r])
+                self.fpres_1m2.append(self.fpres1[idx_r] - self.fpres2[idx_r])
+                self.dot_l_acc.append(np.cross(self.rb, (self.facc_1m2[-1]).T))
+                self.dot_l_pres.append(np.cross(self.rb, (self.fpres_1m2[-1]).T))
+                self.dot_L_acc.append(self.fcb.mu_b * self.dot_l_acc[-1])
+                self.dot_L_pres.append(self.fcb.mu_b * self.dot_l_pres[-1])
+                self.dot_eth_acc.append(np.sum(self.vb_inertial * self.facc_1m2[-1], axis=0))
+                self.dot_eth_pres.append(np.sum(self.vb_inertial * self.fpres_1m2[-1], axis=0))
 
         # np.cross treat the last axis as the vector axis (so r1/r2 is transposed)
         self.fgrav_1m2 = []
@@ -812,31 +856,54 @@ class dot_L:
         # now all other terms toward total quantities
         self.dot_L_mu_b = []; 
         self.dot_l_tot, self.dot_L_tot, self.dot_eth = [], [], []
-        for idx in range(self.dmdp.num_r_ev):
-            self.dot_L_mu_b.append(self.dmdp.mdot[idx][0][1:] * np.cross(self.r1, self.v1_inertial.T)
-                                   + self.dmdp.mdot[idx][1][1:] * np.cross(self.r2, self.v2_inertial.T))
-            self.dot_l_tot.append(self.dot_l_grav[idx] + self.dot_l_acc[idx] + self.dot_l_pres[idx])
-            self.dot_L_tot.append(self.dot_L_grav[idx] + self.dot_L_acc[idx] + self.dot_L_pres[idx] + self.dot_L_mu_b[-1])
-            self.dot_eth.append(- self.dmdp.mdot_tot[idx][1:] / self.fcb.a_b 
-                                + self.dot_eth_grav[idx] + self.dot_eth_acc[idx] + self.dot_eth_pres[idx])
+        if self.dmdp_acc_exist:
+            for idx in range(self.dmdp.num_r_ev):
+                self.dot_L_mu_b.append(self.dmdp.mdot[idx][0][1:] * np.cross(self.r1, self.v1_inertial.T)
+                                       + self.dmdp.mdot[idx][1][1:] * np.cross(self.r2, self.v2_inertial.T))
+                self.dot_l_tot.append(self.dot_l_grav[idx] + self.dot_l_acc[idx] + self.dot_l_pres[idx])
+                self.dot_L_tot.append(self.dot_L_grav[idx] + self.dot_L_acc[idx] + self.dot_L_pres[idx] + self.dot_L_mu_b[-1])
+                self.dot_eth.append(- self.dmdp.mdot_tot[idx][1:] / self.fcb.a_b 
+                                    + self.dot_eth_grav[idx] + self.dot_eth_acc[idx] + self.dot_eth_pres[idx])
+        else:
+            for idx in range(self.dv.Nt):
+                self.dot_L_mu_b.append(np.zeros_like(self.v1_inertial[0]))
+                self.dot_l_tot.append(self.dot_l_grav[idx])
+                self.dot_L_tot.append(self.dot_L_grav[idx])
+                self.dot_eth.append(self.dot_eth_grav[idx])
         
         self.adot_oa_eth, self.adot_oa_l, self.adot_oa_L = [], [], []
         self.e2dot = []
-        for idx_r in range(self.dmdp.num_r_ev):
-            self.adot_oa_eth.append(self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0))
-            # calculate everything when e0_prec is True
-            if self.fcb.e > 0.0 or self.fcb.e0_prec is True:
-                self.e2dot.append((2 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0) 
-                                   - 2 * (self.dot_l_tot[idx_r] / self.fcb.l_0)) * (1 - self.fcb.e**2))
-                if self.fcb.e > 0.0:
-                    self.adot_oa_l.append(None); self.adot_oa_L.append(None)
-            if self.fcb.e == 0.0:
-                self.adot_oa_l.append(2 * self.dot_l_tot[idx_r] / self.fcb.l_0 - self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
-                if self.fcb.q_b == 1.0:
-                    self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 - 3 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
-                else:
-                    self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 + self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b
-                                        - 2 * self.dmdp.mdot[idx_r][0, 1:] / self.fcb.M1 - 2 * self.dmdp.mdot[idx_r][1, 1:] / self.fcb.M2)
+        if self.dmdp_acc_exist:
+            for idx_r in range(self.dmdp.num_r_ev):
+                self.adot_oa_eth.append(self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0))
+                # calculate everything when e0_prec is True
+                if self.fcb.e > 0.0 or self.fcb.e0_prec is True:
+                    self.e2dot.append((2 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b - (self.dot_eth[idx_r] / self.fcb.eth_0)
+                                       - 2 * (self.dot_l_tot[idx_r] / self.fcb.l_0)) * (1 - self.fcb.e**2))
+                    if self.fcb.e > 0.0:
+                        self.adot_oa_l.append(None); self.adot_oa_L.append(None)
+                if self.fcb.e == 0.0:
+                    self.adot_oa_l.append(2 * self.dot_l_tot[idx_r] / self.fcb.l_0 - self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
+                    if self.fcb.q_b == 1.0:
+                        self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 - 3 * self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b)
+                    else:
+                        self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0 + self.dmdp.mdot_tot[idx_r][1:] / self.fcb.M_b
+                                              - 2 * self.dmdp.mdot[idx_r][0, 1:] / self.fcb.M1 - 2 * self.dmdp.mdot[idx_r][1, 1:] / self.fcb.M2)
+        else:
+            for idx_r in range(self.dv.Nt):
+                self.adot_oa_eth.append(- (self.dot_eth[idx_r] / self.fcb.eth_0))
+                # calculate everything when e0_prec is True
+                if self.fcb.e > 0.0 or self.fcb.e0_prec is True:
+                    self.e2dot.append(( - (self.dot_eth[idx_r] / self.fcb.eth_0) 
+                                    - 2 * (self.dot_l_tot[idx_r] / self.fcb.l_0)) * (1 - self.fcb.e**2))
+                    if self.fcb.e > 0.0:
+                        self.adot_oa_l.append(None); self.adot_oa_L.append(None)
+                if self.fcb.e == 0.0:
+                    self.adot_oa_l.append(2 * self.dot_l_tot[idx_r] / self.fcb.l_0)
+                    if self.fcb.q_b == 1.0:
+                        self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0)
+                    else:
+                        self.adot_oa_L.append(2 * self.dot_L_tot[idx_r] / self.fcb.L_0)
 
         # convenient strings
         self.ta_str = self.fcb.ta_str
@@ -846,42 +913,68 @@ class dot_L:
     def basic_results(self, t0mean, rmean, idx_r = 0, breakdown=False, header=True, **kwargs):
         self.rmean_t = rmean(self.dv.t[1:])
         self.idx_dvt = kwargs.get("idx_dvt", self.dv.t[1:] > t0mean)
-        self.idx_dmdpt = kwargs.get("idx_dmdpt", self.dmdp.t > t0mean)
         self.dt_sum = (self.dv.dt[1:])[self.idx_dvt].sum()
-        self.dtmean = lambda q : (q * self.dmdp.dt[1:])[self.idx_dvt].sum() / self.dt_sum
-        self.mean_dot_m_tot = self.dtmean(self.dmdp.mdot_tot[idx_r][1:])
+        self.dtmean = lambda q : (q * self.dv.dt[1:])[self.idx_dvt].sum() / self.dt_sum
+        if self.dmdp_acc_exist:
+            self.idx_dmdpt = kwargs.get("idx_dmdpt", self.dmdp.t > t0mean)
+            self.mean_dot_m_tot = self.dtmean(self.dmdp.mdot_tot[idx_r][1:])
+        else:
+            self.mean_dot_m_tot = 0.0
         self.mean_dot_L_tot = self.dtmean(self.dot_L_tot[idx_r])
         self.mean_dot_eth = self.dtmean(self.dot_eth[idx_r])
+        if self.spin_flag:
+            self.mean_dot_S_1 = self.dtmean(self.dmdp.Sdot[idx_r][0][1:])
+            self.mean_dot_S_2 = self.dtmean(self.dmdp.Sdot[idx_r][1][1:])
 
         if header:
-            h_str = f"{'<dot_m>':>18s}{'<dot_eth>':>18s}{'<dot_l>':>18s}{'<dot_L>':>18s}{'<dot_L>/<dot_m>':>18s}{'<dot_a>/a[dotM/M]':>18s}"
+            h_str = f"{'<dot_m>':>18s}{'<dot_eth>':>18s}{'<dot_l>':>18s}{'<dot_L>':>18s}"
+            h_str += f"{'<dot_L>/<dot_m>':>18s}" if self.dmdp_acc_exist else ""
+            h_str += f"{'<dot_a>/a[dotM/M]':>18s}" if self.dmdp_acc_exist else f"{'<dot_a>/a':>18s}"
             if self.fcb.e > 0 or self.fcb.e0_prec is True:
-                h_str += f"{'<dot_e^2>[dotM/M]':>18s}"
+                h_str += f"{'<dot_e^2>[dotM/M]':>18s}" if self.dmdp_acc_exist else f"{'<dot_e^2>':>18s}"
             #if self.fcb.q_b < 1:
-            h_str += f"{'<eta>':>18s}"
-            if breakdown:
+            if self.dmdp_acc_exist:
+                h_str += f"{'<eta>':>18s}"
+            if breakdown and self.dmdp_acc_exist:
                 h_str += f"{'<dot_L_grav>':>18s}{'<dot_L_acc>':>18s}{'<dot_L_pres>':>18s}{'<dot_L_mu_b>':>18s}"
+            else:
+                print("Warning: breakdown is not available for non-accreting cases (i.e., torque only from gravity).")
+            if self.spin_flag:
+                h_str += f"{'<dot_S_1>':>18s}{'<dot_S_2>':>18s}"
             print(h_str)
         
         q_str = f"{ self.mean_dot_m_tot :>18.10e}{ self.mean_dot_eth :>18.10e}" \
-                f"{ self.dtmean(self.dot_l_tot[idx_r]) :>18.10e}{ self.mean_dot_L_tot :>18.10e}" \
-              + f"{ self.dtmean(self.dot_L_tot[idx_r]) / self.mean_dot_m_tot :>18.10e}" \
-              + f"{ self.dtmean(self.adot_oa_eth[idx_r]) / self.mean_dot_m_tot :>18.10e}"
-        if self.fcb.e > 0 or self.fcb.e0_prec is True:
-            q_str += f"{ self.dtmean(self.e2dot[idx_r]) / self.mean_dot_m_tot :>18.10e}"
-        #if self.fcb.q_b < 1:
-        if self.fcb.M1 <= self.fcb.M2:
-            q_str += f"{self.dtmean(self.dmdp.mdot[idx_r][0, 1:]) / self.mean_dot_m_tot :>18.10e}"
-        if self.fcb.M2 < self.fcb.M1:
-            q_str += f"{self.dtmean(self.dmdp.mdot[idx_r][1, 1:]) / self.mean_dot_m_tot :>18.10e}"
-        if breakdown:
-            q_str += f"{ self.dtmean(self.dot_L_grav[idx_r]) :>18.10e}{ self.dtmean(self.dot_L_acc[idx_r]) :>18.10e}" \
-                  + f"{ self.dtmean(self.dot_L_pres[idx_r]) :>18.10e}{ self.dtmean(self.dot_L_mu_b[idx_r]) :>18.10e}"
+                f"{ self.dtmean(self.dot_l_tot[idx_r]) :>18.10e}{ self.mean_dot_L_tot :>18.10e}"
+        if self.dmdp_acc_exist:
+            q_str += f"{ self.dtmean(self.dot_L_tot[idx_r]) / self.mean_dot_m_tot :>18.10e}"\
+                     f"{ self.dtmean(self.adot_oa_eth[idx_r]) / self.mean_dot_m_tot :>18.10e}"
+            if self.fcb.e > 0 or self.fcb.e0_prec is True:
+                q_str += f"{ self.dtmean(self.e2dot[idx_r]) / self.mean_dot_m_tot :>18.10e}"
+            #if self.fcb.q_b < 1:
+            if self.fcb.M1 <= self.fcb.M2:
+                q_str += f"{self.dtmean(self.dmdp.mdot[idx_r][0, 1:]) / self.mean_dot_m_tot :>18.10e}"
+            if self.fcb.M2 < self.fcb.M1:
+                q_str += f"{self.dtmean(self.dmdp.mdot[idx_r][1, 1:]) / self.mean_dot_m_tot :>18.10e}"
+            if breakdown:
+                q_str += f"{ self.dtmean(self.dot_L_grav[idx_r]) :>18.10e}{ self.dtmean(self.dot_L_acc[idx_r]) :>18.10e}" \
+                      + f"{ self.dtmean(self.dot_L_pres[idx_r]) :>18.10e}{ self.dtmean(self.dot_L_mu_b[idx_r]) :>18.10e}"
+            if self.spin_flag:
+                q_str += f"{ self.mean_dot_S_1 :>18.10e}{ self.mean_dot_S_2 :>18.10e}"
+        else:
+            q_str += f"{ self.dtmean(self.adot_oa_eth[idx_r]):>18.10e}"
+            if self.fcb.e > 0 or self.fcb.e0_prec is True:
+                q_str += f"{ self.dtmean(self.e2dot[idx_r]):>18.10e}"
+        
         print(q_str)
 
 
 # ******************************************************************************
-# Handle data for a clean restart (for dmdp_acc.dat and dv_grav.dat)
+# Handle data for a clean restart (for dmdp_acc.dat, dv_grav.dat, and dp_spin.dat)
+# Example usage:
+# >>> DatManipulator.cut_dat("dmdp_acc.dat.bak", 2 + 14 * 3, N_cycles, "dmdp_acc.dat")
+#     DatManipulator.cut_dat("dv_grav.dat.bak", 2 + 8 * 3, N_cycles, "dv_grav.dat")
+#     DatManipulator.cut_dat("dp_spin.dat.bak", 2 * 3, N_cycles, "dv_grav.dat")
+#
 # ******************************************************************************
 
 class DatManipulator:
